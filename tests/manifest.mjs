@@ -134,6 +134,22 @@ export const TESTS = [
 
   // ── L2 安全设计 ──
   {
+    file: 'scripts/test-server-regressions.mjs',
+    level: 'L2',
+    module: '后端边界回归',
+    // 脚本自行创建临时库与独立服务，退出时清理，不使用运行器的共享数据目录。
+    runner: 'none',
+    covers: [
+      '聊天读取最新一页、时间戳并列顺序、分页与已读范围',
+      '搜索隐私过滤先于分页',
+      '异常分页参数不产生 SQLite 500',
+      '静态文件与头像的目录边界',
+      '用户端、后台及静态路由的非法 URL 不导致进程退出',
+      '用户与后台请求体必须是 JSON 对象',
+    ],
+    impacts: ['api', 'backend', 'security', 'message', 'admin', 'avatar', 'page'],
+  },
+  {
     file: 'scripts/test-admin.mjs',
     level: 'L2',
     module: '管理后台',

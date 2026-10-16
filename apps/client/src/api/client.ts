@@ -166,8 +166,9 @@ export const api = {
 
   // 消息
   conversations: () => request<{ conversations: any[] }>('/conversations'),
+  // offset=0 取最新一页，offset 增大时加载更早的消息；每页内部按时间正序。
   messages: (peer: string, limit = 50, offset = 0) =>
-    request<{ messages: any[] }>(`/conversations/${peer}/messages?limit=${limit}&offset=${offset}`),
+    request<{ messages: any[]; hasMore: boolean; nextOffset: number | null }>(`/conversations/${peer}/messages?limit=${limit}&offset=${offset}`),
   sendMessage: (peer: string, text: string) =>
     request<{ message: any }>(`/conversations/${peer}/messages`, { method: 'POST', body: { text } }),
 

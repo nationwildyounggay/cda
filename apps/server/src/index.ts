@@ -12,7 +12,7 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { mkdirSync, readFileSync, existsSync, statSync, writeFileSync } from 'node:fs'
-import { dirname, join, normalize, extname } from 'node:path'
+import { dirname, join, resolve, relative, isAbsolute, sep, extname } from 'node:path'
 import {
   openDb, hashPassword, verifyPassword, formatUserCode, nextUserSeq,
   nowIso, newId, newToken,
@@ -61,11 +61,16 @@ async function readBody(req: IncomingMessage): Promise<any> {
     chunks.push(c as Buffer)
   }
   if (!chunks.length) return {}
+  let body: unknown
   try {
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
   } catch {
     throw new Error('请求体不是合法 JSON')
   }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    throw new Error('请求体必须是 JSON 对象')
+  }
+  return body
 }
 
 /** 把 /api/users/:code 这样的模式编译成正则 */
@@ -111,8 +116,13 @@ function setBrands(code: string, ids: string[]): void {
 
 const MAX_LIMIT = 50
 function page(req: Req): { limit: number; offset: number } {
-  const limit = Math.min(MAX_LIMIT, Math.max(1, Number(req.query.get('limit')) || 20))
-  const offset = Math.max(0, Number(req.query.get('offset')) || 0)
+  const rawLimit = Number(req.query.get('limit'))
+  const rawOffset = Number(req.query.get('offset'))
+  // SQLite LIMIT/OFFSET 只接受整数；非有限值使用默认值，超大偏移限制到安全整数。
+  const limit = Number.isFinite(rawLimit) && rawLimit !== 0
+    ? Math.min(MAX_LIMIT, Math.max(1, Math.trunc(rawLimit))) : 20
+  const offset = Number.isFinite(rawOffset)
+    ? Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.trunc(rawOffset))) : 0
   return { limit, offset }
 }
 function paged<T>(res: ServerResponse, key: string, rows: T[], limit: number, offset: number): void {
@@ -344,6 +354,8 @@ route('POST', '/api/me/avatar', true, (req, res) => {
 
 /** 取头像。不加鉴权 —— 头像是公开展示的，加鉴权反而让 <img> 用不了 */
 route('GET', '/api/avatar/:code', false, (req, res) => {
+  // 参数已经 URL 解码，必须在拼接文件路径前拒绝目录分隔符等非法字符。
+  if (!/^CDA_\d{8,}$/.test(req.params.code!)) return fail(res, 400, '用户码格式不正确')
   const dir = join(dirname(process.env.CDA_DB ?? './data/cda.db'), 'avatars')
   for (const ext of ['png', 'jpeg', 'webp']) {
     const f = join(dir, `${req.params.code}.${ext}`)
@@ -393,12 +405,14 @@ route('GET', '/api/users', true, (req, res) => {
   if (!q) return json(res, 200, { ok: true, users: [] })
   const like = `%${q}%`
   const { limit, offset } = page(req)
-  const rows = db.prepare(
-    'SELECT * FROM users WHERE (nickname LIKE ? OR code LIKE ?) AND code != ? LIMIT ? OFFSET ?',
-  ).all(like, like, req.code!, limit + 1, offset) as any[]
-  // 尊重对方的「不被搜索到」隐私设置
-  const users = rows.filter((u) => !JSON.parse(u.privacy || '{}').hideFromSearch).map((u) => toUser(u))
-  paged(res, 'users', users, limit, offset)
+  // 先过滤隐私再分页，否则隐藏用户会占据名额，并使 hasMore 提前变成 false。
+  const rows = db.prepare(`
+    SELECT * FROM users
+    WHERE (nickname LIKE ? OR code LIKE ?) AND code != ?
+      AND COALESCE(json_extract(privacy, '$.hideFromSearch'), 0) = 0
+    ORDER BY seq ASC LIMIT ? OFFSET ?
+  `).all(like, like, req.code!, limit + 1, offset) as any[]
+  paged(res, 'users', rows.map((u) => toUser(u)), limit, offset)
 })
 
 route('GET', '/api/users/:code', true, (req, res) => {
@@ -641,18 +655,26 @@ route('GET', '/api/conversations/:peer/messages', true, (req, res) => {
   const me = req.code!
   const peer = req.params.peer!
   const convId = convOf(me, peer)
-  // 历史消息按时间正序分页；前端默认拉最新的一页
+  // offset 从最新消息向过去翻页；页内仍按时间正序展示。
   const { limit, offset } = page(req)
-  const rows = db.prepare('SELECT * FROM messages WHERE conv_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?')
-    .all(convId, limit, offset) as any[]
-  // 读过的标记为已读
-  db.prepare('UPDATE messages SET read_at = ? WHERE conv_id = ? AND from_code != ? AND read_at IS NULL')
-    .run(nowIso(), convId, me)
+  const rows = db.prepare('SELECT * FROM messages WHERE conv_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?')
+    .all(convId, limit + 1, offset) as any[]
+  const hasMore = rows.length > limit
+  const messages = rows.slice(0, limit).reverse()
+  // 仅标记实际返回的消息，不把未加载的旧页或探测下一页的那条也设为已读。
+  if (messages.length) {
+    const placeholders = messages.map(() => '?').join(',')
+    db.prepare(`UPDATE messages SET read_at = ?
+      WHERE conv_id = ? AND from_code != ? AND read_at IS NULL AND id IN (${placeholders})`)
+      .run(nowIso(), convId, me, ...messages.map((m) => m.id))
+  }
   json(res, 200, {
     ok: true,
-    messages: rows.map((m) => ({
+    messages: messages.map((m) => ({
       id: m.id, text: m.text, fromMe: m.from_code === me, createdAt: m.created_at,
     })),
+    hasMore,
+    nextOffset: hasMore ? offset + limit : null,
   })
 })
 
@@ -1022,10 +1044,13 @@ const MIME: Record<string, string> = {
 
 function serveStatic(pathname: string, res: ServerResponse): void {
   const rel = pathname === '/' ? 'index.html' : decodeURIComponent(pathname).replace(/^\//, '')
-  // 防目录穿越：规范化后必须仍在 WEB_ROOT 内
-  const full = normalize(join(WEB_ROOT, rel))
-  const rootAbs = normalize(WEB_ROOT)
-  if (!full.startsWith(rootAbs)) return fail(res, 403, '禁止访问')
+  // 比较路径边界，不能用字符串前缀（web-private 并不属于 web）。
+  const rootAbs = resolve(WEB_ROOT)
+  const full = resolve(rootAbs, rel)
+  const fromRoot = relative(rootAbs, full)
+  if (fromRoot === '..' || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)) {
+    return fail(res, 403, '禁止访问')
+  }
 
   let target = full
   if (!existsSync(target) || statSync(target).isDirectory()) {
@@ -1052,7 +1077,7 @@ function serveStatic(pathname: string, res: ServerResponse): void {
 
 // ── 服务 ──────────────────────────────────────────────
 
-const server = createServer(async (rawReq, res) => {
+async function handleRequest(rawReq: IncomingMessage, res: ServerResponse): Promise<void> {
   const req = rawReq as Req
   // 开发期内测：允许任意来源，方便隧道与手机访问
   res.setHeader('access-control-allow-origin', '*')
@@ -1099,12 +1124,18 @@ const server = createServer(async (rawReq, res) => {
     touchPresence(u.code)
   }
 
-  try {
-    await match.fn(req, res)
-  } catch (e) {
-    console.error('[CDA] 接口异常', match.pattern, e)
-    if (!res.headersSent) fail(res, 500, '服务器内部错误')
-  }
+  await match.fn(req, res)
+}
+
+// 覆盖整条分发链路，包括 URL 解码、静态资源及独立的后台异步处理。
+// http 的事件回调不会接管 Promise rejection，必须在这里显式捕获。
+const server = createServer((req, res) => {
+  void handleRequest(req, res).catch((e) => {
+    const invalidUrl = e instanceof URIError
+    if (!invalidUrl) console.error('[CDA] 请求异常', req.method, req.url, e)
+    if (!res.headersSent) fail(res, invalidUrl ? 400 : 500, invalidUrl ? 'URL 编码不正确' : '服务器内部错误')
+    else res.destroy()
+  })
 })
 
 server.listen(PORT, '0.0.0.0', () => {

@@ -55,6 +55,19 @@ bash scripts/run-api-test.sh    # 47 项端到端断言，每次都从干净的�
 列表类接口统一支持 `?limit=&offset=`，返回 `hasMore` 与 `nextOffset`
 （多取一条判断有无下一页，省掉额外的 COUNT 查询）。
 
+消息历史的 `offset=0` 返回最新一页，增大 `offset` 读取更早的消息；每页内部
+仍按时间正序展示。只有实际返回的消息会标记为已读。用户搜索先过滤隐藏用户，
+再计算分页；`limit` / `offset` 会取整并限制范围，非有限值使用默认值。
+
+请求体必须为 JSON 对象。非法 URL 编码返回 400，异常请求不会使服务进程退出。
+静态资源与头像路径均校验目录边界。
+
+相关回归测试可独立运行（零 npm 依赖，临时数据库自动清理）：
+
+```bash
+node scripts/test-server-regressions.mjs
+```
+
 ## 表结构（13 张，`PRAGMA user_version` 管理迁移）
 
 | 领域 | 表 |
