@@ -47,8 +47,7 @@ export class TryonEngine {
   /**
    * 雕刻网格人体。非空时**取代** SDF 人台。
    *
-   * SDF 模型仍然保留（`this.model`），因为服装壳的射线求交依赖它 ——
-   * 两者由同一份身型数据驱动，所以大致对齐。
+   * SDF 模型保留为加载失败时的回退；网格加载后服装使用网格的关节与体表。
    */
   private meshBody: MeshBody | null = null
   /** 脚下假阴影。用程序化纹理而非 shadowMap，移动端更省 */
@@ -64,6 +63,8 @@ export class TryonEngine {
 
   private frameHandle: number | null = null
   private running = false
+  private disposed = false
+  private meshRequest = 0
   private dirty = true
 
   /** 相机轨道参数 */
@@ -99,6 +100,7 @@ export class TryonEngine {
     this.scene.add(this.groundShadow)
     this.rebuildMannequin()
     this.frameBody()
+    this.distance = this.baseDistance
     this.updateCamera()
   }
 
@@ -206,7 +208,6 @@ export class TryonEngine {
     const fovRad = (this.camera.fov * Math.PI) / 180
     // 参考值取 2.15m：205cm 的人也能完整入画（含脚），且高矮差异清晰可见
     this.baseDistance = FRAME_REF / (2 * Math.tan(fovRad / 2))
-    this.distance = this.baseDistance
   }
 
 
@@ -219,43 +220,22 @@ export class TryonEngine {
    * 服装仍会重算（否则衣服会在拖动时脱离身体），但整体开销可控。
    */
   setBodyProfile(profile: BodyProfile, quality: MannequinQuality = 'final'): void {
-    const t0 = Date.now()
+    if (this.disposed) return
     this.model = createBodyModel(profile)
-    const tModel = Date.now() - t0
     this.rebuildMannequin(quality)
     this.frameBody()
-
-    /*
-     * ⚠️ 雕刻网格激活时**不重建服装**。
-     *
-     * three.js 的 Raycaster 是逐三角形测试，网格有 26576 个三角形，
-     * 一件衣服几百条射线 → 单件就要千万次三角形测试，
-     * 重建全部服装需要数秒，拖动滑杆会彻底卡死。
-     * 服装迁移尚未完成（贴合不合格），先跳过；见 docs/待办.md P0。
-     */
-    if (this.meshBody) {
-      const dt = Date.now() - t0
-      if (dt > 120) console.log(`[CDA-PERF] 改体型(网格) ${dt}ms (其中 SDF 模型 ${tModel}ms)`)
-      this.dirty = true
-      return
-    }
-
-    // 服装几何依赖身体截面，身型变了必须重建
-    const entries = [...this.garments.entries()]
-    for (const [productId] of entries) {
-      const g = this.garments.get(productId)!
-      const mode = g.wearMode
-      const closed = g.fastenerClosed
-      this.removeGarment(productId)
-      const next = this.addGarment(productId)
-      if (next) {
-        next.setWearMode(mode)
-        next.setFastenerClosed(closed)
-      }
-    }
-    const dt = Date.now() - t0
-    if (dt > 120) console.log(`[CDA-PERF] 改体型(SDF) ${dt}ms`)
+    this.refitGarments()
     this.dirty = true
+  }
+
+  private refitGarments(): void {
+    for (const [productId, garment] of [...this.garments]) {
+      const { wearMode, fastenerClosed, spec } = garment
+      this.removeGarment(productId)
+      const next = this.addGarment(productId, spec.color, spec.dimensions)
+      next?.setWearMode(wearMode)
+      next?.setFastenerClosed(fastenerClosed)
+    }
   }
 
   getBodyProfile(): BodyProfile {
@@ -269,23 +249,35 @@ export class TryonEngine {
    * 见 mesh-body.ts 的算法说明。
    */
   async useMeshBody(url: string): Promise<void> {
-    // ⚠️ 档案必须在 await **之后**再读。
-    // 曾经在函数开头就读进局部变量，而下载 OBJ 要几百毫秒到数秒，
-    // 期间用户改的体型全部丢失 —— 表现就是「拖滑杆网格纹丝不动」。
+    if (this.disposed) return
+    const request = ++this.meshRequest
     const gender = this.model.profile.gender
-    const mb = await MeshBody.loadFromUrl(url, this.model.profile, gender)
-    const profile = this.model.profile
+    let mb: MeshBody
+    try {
+      mb = await MeshBody.loadFromUrl(url, this.model.profile, gender)
+    } catch (error) {
+      if (this.disposed || request !== this.meshRequest) return
+      throw error
+    }
+    if (this.disposed || request !== this.meshRequest || gender !== this.model.profile.gender) {
+      mb.dispose()
+      return
+    }
+    // The slider may have changed while the asset was downloading.
+    mb.setProfile(this.model.profile)
     if (this.meshBody) {
       this.world.remove(this.meshBody.object3D)
       this.meshBody.dispose()
     }
     this.meshBody = mb
     this.world.add(mb.object3D)
-    mb.setProfile(profile)
-    if (this.mannequin) this.mannequin.visible = false
+    if (this.mannequin) {
+      this.world.remove(this.mannequin)
+      disposeObject(this.mannequin)
+      this.mannequin = null
+    }
+    this.refitGarments()
     this.dirty = true
-
-
   }
 
   /** 是否正在使用雕刻网格人体 */
@@ -303,7 +295,7 @@ export class TryonEngine {
     if (dimensions) this.garmentDimensions.set(productId, dimensions)
     const dims = dimensions ?? this.garmentDimensions.get(productId)
     // 有雕刻网格时，服装按**网格的实际表面**求交
-    const garment = createGarment(this.model, productId, colorHex, dims, this.meshBody ?? undefined)
+    const garment = createGarment(this.meshBody?.fittingModel(this.model) ?? this.model, productId, colorHex, dims, this.meshBody ?? undefined)
     if (!garment) return null
 
     // 按 bodySlot 决定层级顺序，保证外套在外、内衣在里
@@ -465,9 +457,20 @@ export class TryonEngine {
   }
 
   dispose(): void {
+    if (this.disposed) return
+    this.disposed = true
+    this.meshRequest++
     this.stop()
     this.clearGarments()
     if (this.mannequin) disposeObject(this.mannequin)
+    this.meshBody?.dispose()
+    this.meshBody = null
+    if (this.groundShadow) {
+      const material = this.groundShadow.material as THREE.MeshBasicMaterial
+      material.map?.dispose()
+      disposeObject(this.groundShadow)
+    }
+    this.world.clear()
     this.renderer.dispose()
   }
 

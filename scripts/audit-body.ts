@@ -12,32 +12,14 @@
  *   node_modules/.bin/esbuild scripts/audit-body.ts --bundle --format=esm \
  *     --platform=node --outfile=/tmp/audit.mjs && node /tmp/audit.mjs
  */
+import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import {
   createBodyState, deriveProfile, setHeight, setWeight, setGirth, setFrame,
-  rangeOf, GIRTH_KEYS, FRAME_KEYS,
+  rangeOf, GIRTH_KEYS, FRAME_KEYS, FRAME_RANGES, HEIGHT_RANGE, WEIGHT_RANGE,
   type BodyState, type FrameKey, type GirthKey, type Gender,
 } from '../packages/core/src/index'
 import { MeshBody } from '../packages/tryon-engine/src/mesh-body'
-
-// 与 index.vue 中的 FRAME_RANGES 保持一致（理想情况下应抽到共享常量）
-const FRAME_RANGES: Record<FrameKey, { min: number; max: number }> = {
-  shoulderWidthCm: { min: 34, max: 52 },
-  neckLengthCm: { min: 6, max: 15 },
-  torsoLengthCm: { min: 36, max: 58 },
-  upperArmCm: { min: 24, max: 38 },
-  forearmCm: { min: 20, max: 32 },
-  thighCm: { min: 36, max: 56 },
-  calfCm: { min: 30, max: 48 },
-}
-const HEIGHT_RANGE: Record<Gender, { min: number; max: number }> = {
-  male: { min: 165, max: 195 },
-  female: { min: 155, max: 180 },
-}
-const WEIGHT_ABS: Record<Gender, { min: number; max: number }> = {
-  male: { min: 55, max: 100 },
-  female: { min: 40, max: 90 },
-}
 
 /** 从 OBJ 文本里取出三角面，用于构建边表 */
 function parseEdges(text: string): Array<[number, number]> {
@@ -166,7 +148,7 @@ for (const gender of ['male', 'female'] as const) {
   // 每个参数取两端
   cases.push({ label: `${gender} 身高min`, gender, apply: (s) => setHeight(s, HEIGHT_RANGE[gender].min) })
   cases.push({ label: `${gender} 身高max`, gender, apply: (s) => setHeight(s, HEIGHT_RANGE[gender].max) })
-  const wAbs = WEIGHT_ABS[gender]
+  const wAbs = WEIGHT_RANGE[gender]
   const wDer = rangeOf(base, 'weightKg')
   cases.push({ label: `${gender} 体重min`, gender, apply: (s) => setWeight(s, Math.max(wAbs.min, wDer.min)) })
   cases.push({ label: `${gender} 体重max`, gender, apply: (s) => setWeight(s, Math.min(wAbs.max, wDer.max)) })
@@ -214,7 +196,7 @@ for (const gender of ['male', 'female'] as const) {
 
 const bodies: Record<string, MeshBody> = {}
 for (const g of ['male', 'female'] as const) {
-  bodies[g] = MeshBody.loadFromText(texts[g]!, createBodyState(g) as never as never, g)
+  bodies[g] = MeshBody.loadFromText(texts[g]!, deriveProfile(createBodyState(g)), g)
 }
 
 console.log(`\n共 ${cases.length} 个用例\n`)
@@ -238,3 +220,9 @@ for (const r of results.slice(0, 12)) {
 }
 const worst = results[0]!
 console.log(`\n全局最差：${worst.label}  maxStretch=${worst.a.maxStretch.toFixed(3)}  顶点 ${worst.a.worstAt}`)
+
+for (const result of results) {
+  assert.equal(result.a.badEdges, 0, `${result.label}: locally distorted edges`)
+}
+for (const body of Object.values(bodies)) body.dispose()
+console.log(`PASS: ${cases.length} parameter-boundary cases, no local edge outliers above 1.8x`)

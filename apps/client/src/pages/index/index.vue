@@ -433,19 +433,24 @@ function applyPoseFromQuery() {
 const useMesh = ref(true)
 const meshLoading = ref(false)
 const meshError = ref('')
+let meshRequest = 0
 
 async function loadMesh() {
-  if (!engine || meshLoading.value) return
+  if (!engine) return
+  const currentEngine = engine
+  const request = ++meshRequest
   meshLoading.value = true
   meshError.value = ''
   try {
-    await engine.useMeshBody(`/static/models/${state.gender}.obj`)
-    useMesh.value = engine.usingMeshBody
+    await currentEngine.useMeshBody(`/static/models/${state.gender}.obj`)
+    if (request !== meshRequest || engine !== currentEngine) return
+    useMesh.value = currentEngine.usingMeshBody
   } catch (err) {
+    if (request !== meshRequest || engine !== currentEngine) return
     meshError.value = String(err)
     console.error('[CDA] 雕刻网格加载失败:', err)
   } finally {
-    meshLoading.value = false
+    if (request === meshRequest) meshLoading.value = false
   }
 }
 

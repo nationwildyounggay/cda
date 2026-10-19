@@ -2,26 +2,21 @@
  * 服装壳层 + 精细穿法 —— 亮点2 Step1/Step2 的实现。
  *
  * 核心策略（对应项目计划里的「降级方案」）：
- *   ❌ 不做真实布料物理 —— 手机端 60fps 做不到，业界也无工程化方案
- *   ✅ 分层刚性贴合 —— 服装 = 身体截面 + 径向偏移，天然贴合、永不穿模
+ *   当前版本采用参数化衣片拟合，未运行真实布料物理
+ *   ✅ 分层贴合 —— 连续衣片按体表拟合；不等同于布料碰撞求解
  *   ✅ 顶点解析变形 —— 「扣几颗扣子 / 披 / 围 / 系」用解析位移表达
  *
  * 为什么用「直接顶点变形」而不是 Three.js 的 morph target：
  *   morph target 适合离散的、数量固定的姿态；而「扣子扣几颗」是**连续量**
  *   （0..N 颗），做成 N 个 morph 会爆炸。直接按状态重算顶点更简单也更灵活。
- *   服装壳层只有几百个顶点，每次重算的开销可以忽略。
+ *   穿法直接更新已有顶点；体型变化时才重新拟合衣片。
  */
 import * as THREE from 'three'
 import type { BodySlot, GarmentDimensions, WearMode } from '@cda/core'
 import type { BodySurface } from './mesh-body'
-import {
-  buildArmSpecs,
-  buildLegSpecs,
-  limbPointAt,
-  limbRadiusAt,
-  type BodyModel,
-  type LimbSpec,
-} from './body'
+import { buildUpperGarment, type GarmentVertexParam } from './garment-upper'
+import type { BodyModel } from './body'
+import { buildLowerGarment } from './garment-lower'
 
 /** 各挂载部位的基准外扩量（cm）—— 布料本身撑在皮肤之外的那点空隙 */
 const SLOT_BASE_OFFSET_CM: Record<BodySlot, number> = {
@@ -124,12 +119,7 @@ export const WEAR_MODE_LABEL: Record<WearMode, string> = {
   tied: '系在腰上',
 }
 
-interface VertexParam {
-  /** 归一化高度 */
-  t: number
-  /** 绕身体一周的角度，0 = 正前方 */
-  theta: number
-}
+type VertexParam = GarmentVertexParam
 
 /**
  * 一个可变的服装图层。
@@ -141,7 +131,7 @@ export class Garment {
 
   private readonly meshes: THREE.Mesh[] = []
   /** 每个 mesh 的基准顶点与顶点参数 */
-  private readonly bases: { mesh: THREE.Mesh; base: Float32Array; params: VertexParam[] }[] = []
+  private readonly bases: { mesh: THREE.Mesh; base: Float32Array; params: VertexParam[]; closedFrontPairs?: [number, number][] }[] = []
 
   private _wearMode: WearMode
   private _fastenerClosed: number
@@ -232,6 +222,7 @@ export class Garment {
   }
 
   setColor(hex: number): void {
+    this.spec.color = hex
     for (const m of this.meshes) {
       ;(m.material as THREE.MeshStandardMaterial).color.setHex(hex)
     }
@@ -259,205 +250,36 @@ export class Garment {
     } else if (this.spec.bodySlot === 'neck' || this.spec.bodySlot === 'waist') {
       this.buildBand(group)
     } else {
-      this.buildShell(group)
-      if (this.spec.sleeve) this.buildSleeves(group, this.spec.sleeve)
+      this.buildUpper(group)
     }
 
     this.update()
     return group
   }
 
-  /** 上装 / 外套 / 连衣裙：绕躯干的壳层 */
-  private buildShell(group: THREE.Group): void {
-    const H = this.model.skeleton.height
-    const off = this.offsetCm * 0.01
-    const segs = 48
-    const rows = 26
-
-    const positions: number[] = []
-    const uvs: number[] = []
-    const params: VertexParam[] = []
-    const indices: number[] = []
-    const lastRadius = new Array<number>(segs + 1).fill(0.12)
-
-    for (let r = 0; r <= rows; r++) {
-      const t = this.range.fromT + ((this.range.toT - this.range.fromT) * r) / rows
-      const y = t * H
-      for (let c = 0; c <= segs; c++) {
-        const theta = (c / segs) * Math.PI * 2
-        const dirX = Math.cos(theta)
-        const dirZ = Math.sin(theta)
-        // 从身体中轴向外打一条射线，取到真实表面距离。
-        // 这一步让衣服跟着胸、背、腰的真实起伏走，而不是套一个椭圆。
-        const hit = this.surface.radiusAt(0, y, 0, dirX, 0, dirZ, 0.5)
-        // 射不到（例如该高度已越过肩线、轴点落在体外）就沿用上一行的半径，
-        // 否则会冒出一根尖刺
-        let base = hit
-        if (base === null) base = lastRadius[c]!
-        else lastRadius[c] = base
-        const rad = base + off
-        positions.push(dirX * rad, y, dirZ * rad)
-        uvs.push(c / segs, r / rows)
-        params.push({ t, theta })
-      }
-    }
-
-    const rowIdx = (r: number, c: number) => r * (segs + 1) + c
-    for (let r = 0; r < rows; r++) {
-      for (let c = 0; c < segs; c++) {
-        const a = rowIdx(r, c)
-        const b = rowIdx(r, c + 1)
-        const cc = rowIdx(r + 1, c + 1)
-        const d = rowIdx(r + 1, c)
-        indices.push(a, d, b, b, d, cc)
-      }
-    }
-
-    const geo = new THREE.BufferGeometry()
-    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
-    geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2))
-    geo.setIndex(indices)
-    geo.computeVertexNormals()
-
-    const mesh = new THREE.Mesh(geo, this.material())
+  /** 衣身、肩部和袖子共用边界顶点，穿法变化时保持连接。 */
+  private buildUpper(group: THREE.Group): void {
+    const { geometry, params, closedFrontPairs } = buildUpperGarment(
+      this.model, this.surface, this.spec, this.range.fromT, this.offsetCm * 0.01,
+    )
+    const mesh = new THREE.Mesh(geometry, this.material())
     mesh.name = this.spec.productId
     group.add(mesh)
     this.meshes.push(mesh)
-    this.bases.push({ mesh, base: new Float32Array(positions), params })
+    const base = new Float32Array(geometry.getAttribute('position').array)
+    this.bases.push({ mesh, base, params, closedFrontPairs })
   }
 
-  /** 下装：两条绕腿的管子，半径向 SDF 求贴合 */
+  /** 腰部、两条裤腿与裆部共用连接边。 */
   private buildLegs(group: THREE.Group): void {
     const H = this.model.skeleton.height
-    const off = this.offsetCm * 0.01
-    const segs = 28
-    const rows = 22
-
-    for (const leg of buildLegSpecs(this.model)) {
-      const positions: number[] = []
-      const uvs: number[] = []
-      const params: VertexParam[] = []
-      const indices: number[] = []
-
-      // 裤腰略高于胯（d 为负 = 沿路径向上外推），裤脚到脚踝
-      const dTop = -0.055
-      const dBottom = leg.length * 0.985
-
-      for (let r = 0; r <= rows; r++) {
-        const k = r / rows
-        const d = dTop + (dBottom - dTop) * k
-        const center = limbPointAt(leg, d)
-        const fallback = limbRadiusAt(leg, Math.max(0, d))
-        const t = center.y / H
-
-        for (let c = 0; c <= segs; c++) {
-          const theta = (c / segs) * Math.PI * 2
-          const dirX = Math.cos(theta)
-          const dirZ = Math.sin(theta)
-          // 上限取解析半径的 2 倍：超过说明射线穿到了另一条腿，
-          // 此时必须回退解析半径，否则一条裤腿会把整个骨盆包进去
-          const hit = this.surface.radiusAt(center.x, center.y, center.z, dirX, 0, dirZ, fallback * 2)
-          const rad = (hit ?? fallback) + off
-          positions.push(center.x + dirX * rad, center.y, center.z + dirZ * rad)
-          uvs.push(c / segs, k)
-          params.push({ t, theta })
-        }
-      }
-
-      const rowIdx = (r: number, c: number) => r * (segs + 1) + c
-      for (let r = 0; r < rows; r++) {
-        for (let c = 0; c < segs; c++) {
-          const a = rowIdx(r, c)
-          const b = rowIdx(r, c + 1)
-          const cc = rowIdx(r + 1, c + 1)
-          const dd = rowIdx(r + 1, c)
-          indices.push(a, b, dd, b, cc, dd)
-        }
-      }
-
-      const geo = new THREE.BufferGeometry()
-      geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
-      geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2))
-      geo.setIndex(indices)
-      geo.computeVertexNormals()
-
-      const mesh = new THREE.Mesh(geo, this.material())
-      mesh.name = `${this.spec.productId}-leg-${leg.side < 0 ? 'l' : 'r'}`
-      group.add(mesh)
-      this.meshes.push(mesh)
-      this.bases.push({ mesh, base: new Float32Array(positions), params })
-    }
-  }
-
-  /**
-   * 袖子：绕手臂的管状壳层。
-   *
-   * 手臂的走向取自骨架（有肘部转折），半径则向 SDF 求真实表面 ——
-   * 所以肱二头肌隆起处袖子会自然跟着鼓起来，而不是一根直筒。
-   */
-  private buildSleeves(group: THREE.Group, kind: 'short' | 'long'): void {
-    const H = this.model.skeleton.height
-    const off = this.offsetCm * 0.01
-    const segs = 24
-    const rows = 18
-    const dims = this.spec.dimensions
-
-    for (const arm of buildArmSpecs(this.model)) {
-      // 有实测袖长就按袖长算覆盖比例。臂长因人而异，
-      // 同一件衣服穿在不同身高的人身上，袖口位置自然不同。
-      const coverage = dims?.sleeveCm
-        ? Math.min(0.98, dims.sleeveCm / 100 / arm.length)
-        : kind === 'long'
-          ? 0.95
-          : 0.36
-      const len = arm.length * coverage
-      const positions: number[] = []
-      const uvs: number[] = []
-      const params: VertexParam[] = []
-      const indices: number[] = []
-
-      for (let r = 0; r <= rows; r++) {
-        const k = r / rows
-        // 起点略微上移，让袖山与躯干壳层重叠、接缝不露缝
-        const d = -0.014 + (len + 0.014) * k
-        const center = limbPointAt(arm, d)
-        const fallback = limbRadiusAt(arm, Math.max(0, d))
-
-        for (let c = 0; c <= segs; c++) {
-          const theta = (c / segs) * Math.PI * 2
-          const dirX = Math.cos(theta)
-          const dirZ = Math.sin(theta)
-          const hit = this.surface.radiusAt(center.x, center.y, center.z, dirX, 0, dirZ, fallback * 2.2)
-          const radius = (hit ?? fallback) + off
-          positions.push(center.x + dirX * radius, center.y, center.z + dirZ * radius)
-          uvs.push(c / segs, k)
-          params.push({ t: center.y / H, theta })
-        }
-      }
-
-      const rowIdx = (r: number, c: number) => r * (segs + 1) + c
-      for (let r = 0; r < rows; r++) {
-        for (let c = 0; c < segs; c++) {
-          const a = rowIdx(r, c)
-          const b = rowIdx(r, c + 1)
-          const cc = rowIdx(r + 1, c + 1)
-          const dd = rowIdx(r + 1, c)
-          indices.push(a, dd, b, b, dd, cc)
-        }
-      }
-
-      const geo = new THREE.BufferGeometry()
-      geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
-      geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2))
-      geo.setIndex(indices)
-      geo.computeVertexNormals()
-
-      const mesh = new THREE.Mesh(geo, this.material())
-      mesh.name = `${this.spec.productId}-sleeve-${arm.side < 0 ? 'l' : 'r'}`
-      group.add(mesh)
-      this.meshes.push(mesh)
-      this.bases.push({ mesh, base: new Float32Array(positions), params })
-    }
+    const { geometry, params } = buildLowerGarment(this.model, this.surface,
+      this.range.fromT * H, this.range.toT * H, this.offsetCm * 0.01)
+    const mesh = new THREE.Mesh(geometry, this.material())
+    mesh.name = this.spec.productId
+    group.add(mesh)
+    this.meshes.push(mesh)
+    this.bases.push({ mesh, base: new Float32Array(geometry.getAttribute('position').array), params })
   }
 
   /** 配饰：围在脖子/腰上的环带。半径同样向 SDF 求，贴合颈/腰的真实轮廓 */
@@ -470,14 +292,14 @@ export class Garment {
     const uvs: number[] = []
     const params: VertexParam[] = []
     const indices: number[] = []
-    const lastRadius = new Array<number>(segs + 1).fill(0.08)
+    const lastRadius = new Array<number>(segs).fill(0.08)
 
     for (let r = 0; r <= rows; r++) {
       const t = this.range.fromT + ((this.range.toT - this.range.fromT) * r) / rows
       const y = t * H
       // 环带比身体略粗，形成蓬松的围巾感
       const bulge = r === 0 || r === rows ? 0 : Math.sin((r / rows) * Math.PI) * 0.012
-      for (let c = 0; c <= segs; c++) {
+      for (let c = 0; c < segs; c++) {
         const theta = (c / segs) * Math.PI * 2
         const dirX = Math.cos(theta)
         const dirZ = Math.sin(theta)
@@ -492,7 +314,7 @@ export class Garment {
       }
     }
 
-    const rowIdx = (r: number, c: number) => r * (segs + 1) + c
+    const rowIdx = (r: number, c: number) => r * segs + c % segs
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < segs; c++) {
         const a = rowIdx(r, c)
@@ -529,7 +351,7 @@ export class Garment {
    *   - 系在腰上 -> 整体下移到腰部并收紧
    */
   update(): void {
-    for (const { mesh, base, params } of this.bases) {
+    for (const { mesh, base, params, closedFrontPairs } of this.bases) {
       const position = mesh.geometry.getAttribute('position') as THREE.BufferAttribute
       const arr = position.array as Float32Array
 
@@ -549,6 +371,19 @@ export class Garment {
 
       position.needsUpdate = true
       mesh.geometry.computeVertexNormals()
+      // The front edges coincide when buttoned. Share shading across that seam,
+      // while retaining two indices so unbuttoning can create an actual opening.
+      if (closedFrontPairs) {
+        const normals = mesh.geometry.getAttribute('normal') as THREE.BufferAttribute
+        for (const [a, b] of closedFrontPairs) {
+          if (Math.hypot(arr[a * 3]! - arr[b * 3]!, arr[a * 3 + 1]! - arr[b * 3 + 1]!, arr[a * 3 + 2]! - arr[b * 3 + 2]!) > 1e-6) continue
+          const n = new THREE.Vector3().fromBufferAttribute(normals, a).add(new THREE.Vector3().fromBufferAttribute(normals, b)).normalize()
+          normals.setXYZ(a, n.x, n.y, n.z); normals.setXYZ(b, n.x, n.y, n.z)
+        }
+        normals.needsUpdate = true
+      }
+      mesh.geometry.computeBoundingBox()
+      mesh.geometry.computeBoundingSphere()
     }
   }
 
@@ -568,7 +403,7 @@ export class Garment {
     // 用 cos(θ) 会把"前襟"开到侧面去（曾因此导致敞开模式几乎看不出效果）。
     const front = Math.max(0, Math.sin(p.theta))
     // 越靠上、越靠前，张开越明显（模拟衣襟从上往下敞开）
-    const heightK = total > 0 ? Math.max(0, (p.t - this.range.fromT) / (this.range.toT - this.range.fromT)) : 0
+    const heightK = total > 0 ? THREE.MathUtils.clamp((p.t - this.range.fromT) / Math.max(1e-6, this.range.toT - this.range.fromT), 0, 1) : 0
 
     let dx = 0
     let dy = 0
@@ -577,7 +412,7 @@ export class Garment {
     // --- 前襟张开 ---
     if (opening > 0.001 && front > 0.001) {
       const amount = opening * Math.pow(front, 1.4) * (0.35 + 0.65 * heightK)
-      dx += Math.sign(bx) * amount * 0.035
+      dx += (p.openingSide ?? Math.sign(bx)) * amount * 0.035
       dz += amount * 0.045
     }
 

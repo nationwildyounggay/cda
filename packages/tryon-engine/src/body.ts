@@ -150,8 +150,6 @@ export function buildSkeleton(profile: BodyProfile): BodySkeleton {
   const armTilt = 0.80
   const upperLen = profile.upperArmCm / 100
   const foreLen = profile.forearmCm / 100
-  const thighLen = profile.thighCm / 100
-  const calfLen = profile.calfCm / 100
 
   const arms: LimbChain[] = ([-1, 1] as const).map((side) => {
     const rootX = side * shoulderHalf * 0.86
@@ -176,9 +174,9 @@ export function buildSkeleton(profile: BodyProfile): BodySkeleton {
     const rootX = side * hip.w * 0.48
     const root: Vec3 = [rootX, hipY, 0]
     const kneeX = side * hip.w * 0.44
-    const knee: Vec3 = [kneeX, hipY - thighLen, 0.008]
+    const knee: Vec3 = [kneeX, kneeY, 0.008]
     const ankleX = side * hip.w * 0.4
-    const ankle: Vec3 = [ankleX, knee[1] - calfLen, 0]
+    const ankle: Vec3 = [ankleX, ankleY, 0]
     return {
       side, root, mid: knee, end: ankle,
       rRoot: thighR * 1.0,
